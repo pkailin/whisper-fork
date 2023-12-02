@@ -127,6 +127,20 @@ class DecodingResult:
     compression_ratio: float = np.nan
 
 
+@dataclass(frozen=True)
+class CustomDecodingResult:
+    """All hypotheses from beam search"""
+    audio_features: Tensor
+    language: str
+    language_probs: Optional[Dict[str, float]] = None
+    tokens: List[List[int]] = field(default_factory=list)
+    texts: List[str] = field(default_factory=list)
+    avg_logprob: float = np.nan # use just the best hypothesis for this value
+    no_speech_prob: float = np.nan
+    temperature: float = np.nan
+    compression_ratio: float = np.nan # use just the best hypothesis for this value
+
+
 class Inference:
     def logits(self, tokens: Tensor, audio_features: Tensor) -> Tensor:
         """Perform a forward pass on the decoder and return per-token logits"""
@@ -211,6 +225,30 @@ class MaximumLikelihoodRanker(SequenceRanker):
         # get the sequence with the highest score
         lengths = [[len(t) for t in s] for s in tokens]
         return [np.argmax(scores(p, l)) for p, l in zip(sum_logprobs, lengths)]
+
+
+class CustomReturnAllSamplesRanker(SequenceRanker):
+    """
+    Return list of values, where a value is the likelihood for a hypothesis.
+    """
+    def __init__(self, length_penalty: Optional[float]):
+        self.length_penalty = length_penalty
+
+    def rank(self, tokens: List[List[Tensor]], sum_logprobs: List[List[float]]):
+        def scores(logprobs, lengths):
+            result = []
+            for logprob, length in zip(logprobs, lengths):
+                if self.length_penalty is None:
+                    penalty = length
+                else:
+                    # from the Google NMT paper
+                    penalty = ((5 + length) / 6) ** self.length_penalty
+                result.append(logprob / penalty)
+            return result
+
+        # get the sequence with the highest score
+        lengths = [[len(t) for t in s] for s in tokens]
+        return [(scores(p, l)) for p, l in zip(sum_logprobs, lengths)]
 
 
 class TokenDecoder:
@@ -540,7 +578,7 @@ class DecodingTask:
         self.inference = PyTorchInference(model, len(self.initial_tokens))
 
         # sequence ranker: implements how to rank a group of sampled sequences
-        self.sequence_ranker = MaximumLikelihoodRanker(options.length_penalty)
+        self.sequence_ranker = CustomReturnAllSamplesRanker(options.length_penalty)
 
         # decoder: implements how to select the next tokens, given the autoregressive distribution
         if options.beam_size is not None:
@@ -751,42 +789,33 @@ class DecodingTask:
             for s in tokens
         ]
 
-        # select the top-ranked sample in each group
-        selected = self.sequence_ranker.rank(tokens, sum_logprobs)
-        tokens: List[List[int]] = [t[i].tolist() for i, t in zip(selected, tokens)]
+        # rerank the hypotheses by their likelihood from most likely to least likely
+        probabilities = self.sequence_ranker.rank(tokens, sum_logprobs)
+        tokens_ordered = [x for _, x in sorted(zip(probabilities[0], tokens[0]), reverse=True)]
+
+        tokens: List[List[int]] = [t.tolist() for t in tokens_ordered]
         texts: List[str] = [tokenizer.decode(t).strip() for t in tokens]
 
-        sum_logprobs: List[float] = [lp[i] for i, lp in zip(selected, sum_logprobs)]
-        avg_logprobs: List[float] = [
-            lp / (len(t) + 1) for t, lp in zip(tokens, sum_logprobs)
-        ]
+        # NOTE: lengths of decoded beams can have different lengths of words!!!
+        # texts_words_lengths = [len(t.split(' ')) for t in texts]
+        # if len(set(texts_words_lengths)) > 1:
+        #     a=1
 
-        fields = (
-            texts,
-            languages,
-            tokens,
-            audio_features,
-            avg_logprobs,
-            no_speech_probs,
-        )
-        if len(set(map(len, fields))) != 1:
-            raise RuntimeError(f"inconsistent result lengths: {list(map(len, fields))}")
+        # order sum_logprobs of the hypotheses from most likely to least likely
+        sum_logprobs: List[float] = [x for _, x in sorted(zip(probabilities[0], sum_logprobs[0]), reverse=True)]
+        avg_logprobs: List[float] = [lp / (len(tok_seq) + 1) for tok_seq, lp in zip(tokens, sum_logprobs)]
 
-        return [
-            DecodingResult(
-                audio_features=features,
-                language=language,
+        decoding_result = CustomDecodingResult(
+                audio_features=audio_features,
+                language=languages,
                 tokens=tokens,
-                text=text,
-                avg_logprob=avg_logprob,
-                no_speech_prob=no_speech_prob,
+                texts=texts,
+                avg_logprob=avg_logprobs[0],
+                no_speech_prob=no_speech_probs[0],
                 temperature=self.options.temperature,
-                compression_ratio=compression_ratio(text),
-            )
-            for text, language, tokens, features, avg_logprob, no_speech_prob in zip(
-                *fields
-            )
-        ]
+                compression_ratio=compression_ratio(texts[0]))
+
+        return [decoding_result]
 
 
 @torch.no_grad()

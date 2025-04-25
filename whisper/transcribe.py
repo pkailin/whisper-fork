@@ -237,7 +237,8 @@ def transcribe(
     decode_options["prompt"] = all_tokens[prompt_reset_since:]
     result: DecodingResult = decode_with_fallback(mel_segment)
 
-    seeks = [0] * decode_options["beam_size"] # one seek variable for each hypothesis
+    #seeks = [0] * decode_options["beam_size"] # one seek variable for each hypothesis
+    seeks = [0] * 5
 
     if no_speech_threshold is not None:
         # no voice activity check
@@ -354,6 +355,10 @@ def transcribe(
 
             decode_options["prompt"] = all_tokens[prompt_reset_since:]
             result: DecodingResult = decode_with_fallback(mel_segment)
+
+            if s_index >= len(result.tokens):
+                continue  # skip this hypothesis if out of bounds
+
             hypothesis = result.tokens[s_index] # get corresponding hypothesis
             hypothesis = torch.tensor(hypothesis)
 
